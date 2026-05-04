@@ -190,19 +190,33 @@ class BoxRecommendation(Base):
     __tablename__ = "box_recommendations"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+    # nullable=True: 복수 상품(multi-item) 박스 구성에서는 단일 product_id 없음
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=True)
     week_key = Column(String(10), nullable=False, index=True)
 
-    box_size_id = Column(String(10), nullable=False)   # "S","M","L","XL"
-    units_per_box = Column(Integer, nullable=False)
-    total_units = Column(Integer, nullable=False)
-    total_boxes = Column(Integer, nullable=False)
+    box_size_id = Column(String(20), nullable=False)
+    box_name = Column(String(50), nullable=True)          # "우체국 5호" 등 인간 친화 이름
+    label = Column(String(100), nullable=True)            # "황금 박스 #1" 등 사용자 레이블
 
-    estimated_shipping_cost = Column(Float, nullable=False)
-    cost_per_unit = Column(Float, nullable=False)
+    units_per_box = Column(Integer, nullable=True)        # 단일 상품 모드
+    total_units = Column(Integer, nullable=True)
+    total_boxes = Column(Integer, nullable=True)
+
+    # ── 중량 정보 ─────────────────────────────────────────────────────────────
+    actual_weight_kg = Column(Float, nullable=True)
+    dimensional_weight_kg = Column(Float, nullable=True)
+    chargeable_weight_kg = Column(Float, nullable=True)   # max(actual, dim)
+
+    # ── 비용·마진 ─────────────────────────────────────────────────────────────
+    estimated_shipping_cost = Column(Float, nullable=True)
+    cost_per_unit = Column(Float, nullable=True)
+    total_margin_usd = Column(Float, nullable=True)       # 포함 상품들의 총 마진
+    net_margin_usd = Column(Float, nullable=True)         # total_margin - shipping_cost
+    roi = Column(Float, nullable=True)                    # net_margin / shipping_cost
+    packing_efficiency = Column(Float, nullable=True)     # 부피 활용률 0.0~1.0
 
     packing_detail = Column(JSON, nullable=True)
-    # {"arrangement": [...], "dead_space_pct": 12.3}
+    # multi-item: [{"asin": "...", "title": "...", "qty": 3, "margin_usd": 9.0}, ...]
 
     is_approved = Column(Boolean, default=False)
     approved_at = Column(DateTime, nullable=True)

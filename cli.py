@@ -12,6 +12,8 @@ Termux 터미널 환경에서 시스템을 수동으로 조작한다.
   python cli.py weekly-status              # 이번 주 상태 조회
   python cli.py list-recommendations       # 박스 추천 목록 조회
   python cli.py send-reminder              # 주간 비용 입력 알림 즉시 발송
+  python cli.py run-dashboard              # 웹 대시보드 실행 (Streamlit)
+  python cli.py run-dashboard --port 8502  # 포트 지정
 """
 from __future__ import annotations
 
@@ -159,6 +161,30 @@ def cmd_list_recommendations(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_dashboard(args: argparse.Namespace) -> int:
+    import subprocess
+    dashboard = Path(__file__).resolve().parent / "dashboard.py"
+    if not dashboard.exists():
+        print(f"⚠  dashboard.py 를 찾을 수 없습니다: {dashboard}")
+        return 1
+
+    cmd = [
+        sys.executable, "-m", "streamlit", "run", str(dashboard),
+        "--server.port", str(args.port),
+        "--server.address", args.host,
+    ]
+    if args.no_browser:
+        cmd += ["--server.headless", "true"]
+
+    print(f"▶ 대시보드 시작: http://{args.host}:{args.port}")
+    print("  종료하려면 Ctrl+C")
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        print("\n대시보드 종료")
+    return 0
+
+
 def cmd_send_reminder(args: argparse.Namespace) -> int:
     from arbitrage_x.utils.notifier import TelegramNotifier
     from arbitrage_x.utils.week_utils import get_current_week_key
@@ -216,6 +242,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sr = sub.add_parser("send-reminder", help="주간 비용 입력 텔레그램 알림 즉시 발송")
     p_sr.add_argument("--week-key", help="대상 주차")
 
+    # ── run-dashboard ─────────────────────────────────────────────────────────
+    p_dash = sub.add_parser("run-dashboard", help="웹 대시보드 실행 (Streamlit)")
+    p_dash.add_argument("--port", type=int, default=8501, help="포트 번호 (기본: 8501)")
+    p_dash.add_argument("--host", default="localhost", help="바인드 주소 (기본: localhost)")
+    p_dash.add_argument("--no-browser", action="store_true", help="브라우저 자동 실행 안 함")
+
     return parser
 
 
@@ -231,6 +263,7 @@ _HANDLERS = {
     "weekly-status": cmd_weekly_status,
     "list-recommendations": cmd_list_recommendations,
     "send-reminder": cmd_send_reminder,
+    "run-dashboard": cmd_run_dashboard,
 }
 
 

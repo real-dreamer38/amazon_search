@@ -4,6 +4,10 @@
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 
+# Web Dashboard
+streamlit>=1.35.0
+pandas>=2.0.0
+
 # Database
 sqlalchemy>=2.0.0
 alembic>=1.13.0

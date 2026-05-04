@@ -1,12 +1,23 @@
 """
-Arbitrage-X — Logistics API
-UPS Tracking + Amazon SP-API FBA Inbound 연동
+Arbitrage-X — Logistics Tracker (물류 추적 모듈)
+
+UPS Tracking API + Amazon SP-API FBA Inbound 상태 통합 조회.
+이슈 감지:
+  - INBOUND_DELAY  : 마지막 UPS 이벤트 후 7일 이상 이동 없음
+  - ACTION_REQUIRED: 아마존 FC에서 인보이스 제출 요구
+  - UPS_EXCEPTION  : UPS 배송 이상 (분실, 세관 묶임 등)
+  - FC_DELAYED     : FC 입고 처리 지연
+
+Mock 클래스(MockUPSClient, MockAmazonSPClient)는 실제 API 자격증명 없이
+테스트와 개발 환경에서 임의의 시나리오를 재현한다.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional, Protocol, runtime_checkable
 
 import httpx
 
@@ -22,10 +33,154 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
+# 입고 지연 판단 기준일
+DELAY_THRESHOLD_DAYS: int = 7
+
+# 아마존 FC에서 인보이스 제출을 요구하는 상태 코드
+_ACTION_REQUIRED_FC_STATUSES: frozenset[str] = frozenset({
+    "ACTION_REQUIRED",
+    "SUSPENDED",
+    "CLOSED_WITH_ISSUES",
+    "INVOICE_REQUIRED",
+})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# UPS Tracking
+# 이슈 도메인 타입
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+class IssueType(str, Enum):
+    INBOUND_DELAY = "INBOUND_DELAY"
+    ACTION_REQUIRED = "ACTION_REQUIRED"
+    UPS_EXCEPTION = "UPS_EXCEPTION"
+    FC_DELAYED = "FC_DELAYED"
+
+
+@dataclass
+class ShipmentIssue:
+    tracking_number: str
+    issue_type: IssueType
+    message: str
+    amazon_shipment_id: Optional[str] = None
+    detected_at: datetime = field(default_factory=datetime.utcnow)
+    requires_invoice: bool = False
+
+    @property
+    def urgency(self) -> str:
+        """CRITICAL → 즉시 인보이스 소명 필요. WARNING → 모니터링."""
+        if self.requires_invoice or self.issue_type == IssueType.ACTION_REQUIRED:
+            return "CRITICAL"
+        return "WARNING"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 클라이언트 인터페이스
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@runtime_checkable
+class UPSClientProtocol(Protocol):
+    def track(self, tracking_number: str) -> dict: ...
+
+
+@runtime_checkable
+class SPClientProtocol(Protocol):
+    def get_inbound_shipment(self, shipment_id: str) -> dict: ...
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Mock 클라이언트 (테스트 전용)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class MockUPSClient:
+    """
+    결정론적 Mock UPS 클라이언트.
+
+    stalled=True  → event_time을 8일 전으로 설정하여 지연 감지 트리거.
+    status="EXCEPTION" → UPS_EXCEPTION 이슈 트리거.
+    """
+
+    def __init__(
+        self,
+        *,
+        status: str = "IN_TRANSIT",
+        last_event: str = "Package in transit",
+        location: str = "Louisville, KY",
+        event_time: Optional[datetime] = None,
+        estimated_delivery: Optional[str] = None,
+        stalled: bool = False,
+    ):
+        self._status = status
+        self._last_event = last_event
+        self._location = location
+        self._event_time = event_time or (
+            datetime.utcnow() - timedelta(days=8) if stalled
+            else datetime.utcnow() - timedelta(hours=6)
+        )
+        self._estimated_delivery = estimated_delivery
+
+    def track(self, tracking_number: str) -> dict:
+        logger.debug("MockUPSClient.track(%s) → %s", tracking_number, self._status)
+        return {
+            "tracking_number": tracking_number,
+            "status": self._status,
+            "last_event": self._last_event,
+            "location": self._location,
+            "event_time": self._event_time.isoformat(),
+            "estimated_delivery": self._estimated_delivery,
+        }
+
+
+class MockAmazonSPClient:
+    """
+    결정론적 Mock Amazon SP-API 클라이언트.
+
+    action_required=True → "ACTION_REQUIRED" 상태를 반환하여 인보이스 요구 시나리오 재현.
+    fc_delayed=True      → "FC_DELAYED" 상태.
+    """
+
+    def __init__(
+        self,
+        *,
+        amazon_status: str = "WORKING",
+        action_required: bool = False,
+        fc_delayed: bool = False,
+    ):
+        if action_required:
+            self._status = "ACTION_REQUIRED"
+        elif fc_delayed:
+            self._status = "FC_DELAYED"
+        else:
+            self._status = amazon_status
+
+    def get_inbound_shipment(self, shipment_id: str) -> dict:
+        logger.debug("MockAmazonSPClient.get_inbound_shipment(%s) → %s", shipment_id, self._status)
+        fc_status_map = {
+            "WORKING": "FC_RECEIVING",
+            "SHIPPED": "IN_TRANSIT",
+            "IN_TRANSIT": "IN_TRANSIT",
+            "RECEIVING": "FC_RECEIVING",
+            "CLOSED": "FC_RECEIVED",
+            "DELETED": "EXCEPTION",
+            "CANCELLED": "EXCEPTION",
+            "ACTION_REQUIRED": "ACTION_REQUIRED",
+            "FC_DELAYED": "FC_DELAYED",
+            "INVOICE_REQUIRED": "ACTION_REQUIRED",
+        }
+        return {
+            "amazon_status": self._status,
+            "mapped_status": fc_status_map.get(self._status, "UNKNOWN"),
+            "shipment_id": shipment_id,
+            "destination_fc": "BFI4",
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 실제 클라이언트 (운영 환경)
+# ══════════════════════════════════════════════════════════════════════════════
+
 
 class UPSClient:
     """UPS OAuth2 + Track API v2."""
@@ -42,7 +197,6 @@ class UPSClient:
         now = datetime.utcnow()
         if self._token and self._token_expires and now < self._token_expires:
             return self._token
-
         resp = self._http.post(
             self.TOKEN_URL,
             data={"grant_type": "client_credentials"},
@@ -51,24 +205,10 @@ class UPSClient:
         resp.raise_for_status()
         payload = resp.json()
         self._token = payload["access_token"]
-        expires_in = int(payload.get("expires_in", 3600))
-        from datetime import timedelta
-        self._token_expires = now + timedelta(seconds=expires_in - 60)
+        self._token_expires = now + timedelta(seconds=int(payload.get("expires_in", 3600)) - 60)
         return self._token
 
     def track(self, tracking_number: str) -> dict:
-        """
-        단일 트래킹 번호의 현재 상태를 조회한다.
-        반환값:
-            {
-                "status": "IN_TRANSIT",
-                "last_event": "Departed facility",
-                "location": "Louisville, KY",
-                "event_time": "2026-05-03T10:30:00",
-                "estimated_delivery": "2026-05-05",
-                "raw": {...},
-            }
-        """
         try:
             token = self._ensure_token()
             resp = self._http.get(
@@ -80,9 +220,7 @@ class UPSClient:
                 },
             )
             resp.raise_for_status()
-            data = resp.json()
-            return self._parse_tracking(data, tracking_number)
-
+            return self._parse_tracking(resp.json(), tracking_number)
         except httpx.HTTPStatusError as e:
             logger.error("UPS tracking failed [%s]: %s", tracking_number, e)
             return {"status": "ERROR", "error": str(e)}
@@ -95,27 +233,19 @@ class UPSClient:
             shipment = data["trackResponse"]["shipment"][0]
             package = shipment.get("package", [{}])[0]
             activity = package.get("activity", [{}])[0]
-
-            status_code = (
-                activity.get("status", {}).get("statusCode", "")
-            )
             status_map = {
-                "I": "IN_TRANSIT",
-                "O": "OUT_FOR_DELIVERY",
-                "D": "DELIVERED",
-                "P": "PICKED_UP",
-                "X": "EXCEPTION",
-                "M": "PENDING",
+                "I": "IN_TRANSIT", "O": "OUT_FOR_DELIVERY", "D": "DELIVERED",
+                "P": "PICKED_UP", "X": "EXCEPTION", "M": "PENDING",
             }
-            status = status_map.get(status_code, "UNKNOWN")
-
+            status = status_map.get(
+                activity.get("status", {}).get("statusCode", ""), "UNKNOWN"
+            )
             location_data = activity.get("location", {}).get("address", {})
             location = ", ".join(filter(None, [
                 location_data.get("city"),
                 location_data.get("stateProvince"),
                 location_data.get("countryCode"),
             ]))
-
             event_date = activity.get("date", "")
             event_time_str = activity.get("time", "")
             event_time = None
@@ -126,19 +256,16 @@ class UPSClient:
                     ).isoformat()
                 except ValueError:
                     pass
-
-            delivery_date = (
-                package.get("deliveryDate", [{}])[0].get("date")
-                if package.get("deliveryDate") else None
-            )
-
             return {
                 "tracking_number": tracking_number,
                 "status": status,
                 "last_event": activity.get("status", {}).get("description", ""),
                 "location": location,
                 "event_time": event_time,
-                "estimated_delivery": delivery_date,
+                "estimated_delivery": (
+                    package.get("deliveryDate", [{}])[0].get("date")
+                    if package.get("deliveryDate") else None
+                ),
                 "raw": data,
             }
         except (KeyError, IndexError) as e:
@@ -149,15 +276,8 @@ class UPSClient:
         self._http.close()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Amazon SP-API — FBA Inbound
-# ══════════════════════════════════════════════════════════════════════════════
-
 class AmazonSPClient:
-    """
-    Amazon SP-API LWA(Login with Amazon) 인증 + FBA Inbound Shipment 조회.
-    실운영 시 sp-api-python 라이브러리 사용 권장.
-    """
+    """Amazon SP-API LWA 인증 + FBA Inbound Shipment 조회."""
 
     LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
     SP_API_BASE = "https://sellingpartnerapi-na.amazon.com"
@@ -168,11 +288,9 @@ class AmazonSPClient:
         self._http = httpx.Client(timeout=20)
 
     def _get_access_token(self) -> str:
-        from datetime import timedelta
         now = datetime.utcnow()
         if self._access_token and self._token_expires and now < self._token_expires:
             return self._access_token
-
         resp = self._http.post(
             self.LWA_TOKEN_URL,
             data={
@@ -185,14 +303,10 @@ class AmazonSPClient:
         resp.raise_for_status()
         payload = resp.json()
         self._access_token = payload["access_token"]
-        self._token_expires = now + timedelta(seconds=3500)
+        self._token_expires = datetime.utcnow() + timedelta(seconds=3500)
         return self._access_token
 
     def get_inbound_shipment(self, shipment_id: str) -> dict:
-        """
-        FBA 입고 배송 현황 조회.
-        https://developer-docs.amazon.com/sp-api/docs/fulfillment-inbound-api-v2024-03-20
-        """
         try:
             token = self._get_access_token()
             resp = self._http.get(
@@ -204,7 +318,6 @@ class AmazonSPClient:
             )
             resp.raise_for_status()
             return self._parse_inbound(resp.json())
-
         except httpx.HTTPStatusError as e:
             logger.error("SP-API inbound error [%s]: %s", shipment_id, e)
             return {"status": "ERROR", "error": str(e)}
@@ -215,14 +328,10 @@ class AmazonSPClient:
     def _parse_inbound(self, data: dict) -> dict:
         status = data.get("status", "UNKNOWN")
         fc_status_map = {
-            "WORKING": "FC_RECEIVING",
-            "SHIPPED": "IN_TRANSIT",
-            "IN_TRANSIT": "IN_TRANSIT",
-            "RECEIVING": "FC_RECEIVING",
-            "CLOSED": "FC_RECEIVED",
-            "DELETED": "EXCEPTION",
-            "CANCELLED": "EXCEPTION",
-            "ERROR": "EXCEPTION",
+            "WORKING": "FC_RECEIVING", "SHIPPED": "IN_TRANSIT",
+            "IN_TRANSIT": "IN_TRANSIT", "RECEIVING": "FC_RECEIVING",
+            "CLOSED": "FC_RECEIVED", "DELETED": "EXCEPTION",
+            "CANCELLED": "EXCEPTION", "ERROR": "EXCEPTION",
         }
         return {
             "amazon_status": status,
@@ -233,85 +342,182 @@ class AmazonSPClient:
             "raw": data,
         }
 
-    def list_inbound_shipments(self, status_filter: str = "WORKING") -> list[dict]:
-        """활성 입고 배송 목록 조회."""
-        try:
-            token = self._get_access_token()
-            resp = self._http.get(
-                f"{self.SP_API_BASE}/inbound/fba/2024-03-20/inboundPlans",
-                params={"status": status_filter},
-                headers={"x-amz-access-token": token},
-            )
-            resp.raise_for_status()
-            plans = resp.json().get("inboundPlans", [])
-            return [self._parse_inbound(p) for p in plans]
-        except Exception as e:
-            logger.error("SP-API list_inbound_shipments error: %s", e)
-            return []
-
     def close(self):
         self._http.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Logistics Tracker — UPS + SP-API 통합 조율
+# Logistics Tracker — 이슈 감지 엔진
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class LogisticsTracker:
     """
-    DB의 Shipment 레코드를 순회하며 UPS + SP-API로 상태를 갱신하고
-    이슈 발생 시 알림 트리거를 반환한다.
+    UPS + SP-API 조회를 통합하여 배송 이슈를 탐지한다.
+
+    의존성 주입(DI) 방식으로 UPS/SP 클라이언트를 받으므로
+    Mock을 주입하여 실제 API 없이 모든 이슈 시나리오를 재현할 수 있다.
     """
 
-    ALERT_STATUSES = {"EXCEPTION", "FC_DELAYED"}
+    def __init__(
+        self,
+        ups_client=None,
+        sp_client=None,
+    ):
+        self.ups = ups_client or UPSClient()
+        self.sp = sp_client or AmazonSPClient()
 
-    def __init__(self):
-        self.ups = UPSClient()
-        self.sp = AmazonSPClient()
+    # ──────────────────────────────────────────────────────────────────────────
+    # 공개 API
+    # ──────────────────────────────────────────────────────────────────────────
 
-    def refresh_shipment(self, shipment) -> tuple[dict, bool]:
+    def detect_issues(
+        self,
+        tracking_number: str,
+        amazon_shipment_id: Optional[str] = None,
+        last_event_time: Optional[datetime] = None,
+    ) -> list[ShipmentIssue]:
         """
-        단일 Shipment ORM 객체를 갱신한다.
-        반환: (updated_fields_dict, should_alert)
+        UPS 조회 + SP-API 조회를 수행하고 감지된 이슈 목록을 반환한다.
+
+        last_event_time: DB에 저장된 마지막 이벤트 시각
+                        (None이면 UPS 응답의 event_time으로 대체)
         """
-        updates: dict = {"last_checked_at": datetime.utcnow()}
-        should_alert = False
+        issues: list[ShipmentIssue] = []
 
-        # UPS 추적
-        if shipment.tracking_number and shipment.carrier == "UPS":
-            result = self.ups.track(shipment.tracking_number)
-            if result.get("status") not in ("ERROR", "PARSE_ERROR"):
-                ups_status = result["status"]
-                updates["last_event"] = result.get("last_event")
+        # ── UPS 추적 ─────────────────────────────────────────────────────────
+        ups_info = self.ups.track(tracking_number)
+        if ups_info.get("status") not in ("ERROR", "PARSE_ERROR"):
+            # UPS Exception
+            exc = self._check_ups_exception(ups_info, tracking_number)
+            if exc:
+                issues.append(exc)
 
-                if ups_status == "DELIVERED" and not shipment.actual_delivery:
-                    updates["actual_delivery"] = datetime.utcnow()
+            # 입고 지연: UPS 이벤트 후 7일 이상 정체
+            effective_event_time = last_event_time or self._parse_event_time(
+                ups_info.get("event_time")
+            )
+            delay = self._check_inbound_delay(ups_info, tracking_number, effective_event_time)
+            if delay:
+                issues.append(delay)
 
-                # SP-API로 FC 입고 상태 확인
-                if ups_status == "DELIVERED" and shipment.amazon_shipment_id:
-                    sp_result = self.sp.get_inbound_shipment(shipment.amazon_shipment_id)
-                    mapped = sp_result.get("mapped_status", "UNKNOWN")
-                    updates["status"] = mapped
-                    if mapped == "FC_DELAYED":
-                        should_alert = True
-                        updates["alert_message"] = (
-                            f"FC 입고 지연: {shipment.amazon_shipment_id}"
-                        )
-                else:
-                    updates["status"] = ups_status
+        # ── SP-API 조회 ───────────────────────────────────────────────────────
+        if amazon_shipment_id:
+            sp_info = self.sp.get_inbound_shipment(amazon_shipment_id)
+            if sp_info.get("mapped_status") != "ERROR":
+                ar = self._check_action_required(sp_info, tracking_number, amazon_shipment_id)
+                if ar:
+                    issues.append(ar)
+                fc = self._check_fc_delayed(sp_info, tracking_number, amazon_shipment_id)
+                if fc:
+                    issues.append(fc)
 
-                if ups_status == "EXCEPTION":
-                    should_alert = True
-                    updates["alert_message"] = (
-                        f"UPS 배송 이슈: {shipment.tracking_number} — "
-                        f"{result.get('last_event', 'Unknown exception')}"
-                    )
+        if issues:
+            logger.warning(
+                "[TRACKER] %d issue(s) detected for tracking=%s: %s",
+                len(issues),
+                tracking_number,
+                [i.issue_type.value for i in issues],
+            )
+        return issues
 
-        return updates, should_alert
+    # ──────────────────────────────────────────────────────────────────────────
+    # 이슈 감지 헬퍼
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _check_ups_exception(
+        self, ups_info: dict, tracking_number: str
+    ) -> Optional[ShipmentIssue]:
+        if ups_info.get("status") == "EXCEPTION":
+            return ShipmentIssue(
+                tracking_number=tracking_number,
+                issue_type=IssueType.UPS_EXCEPTION,
+                message=(
+                    f"UPS 배송 이상 감지: {ups_info.get('last_event', 'Unknown exception')} "
+                    f"({ups_info.get('location', '')})"
+                ),
+                requires_invoice=False,
+            )
+        return None
+
+    def _check_inbound_delay(
+        self,
+        ups_info: dict,
+        tracking_number: str,
+        event_time: Optional[datetime],
+    ) -> Optional[ShipmentIssue]:
+        """마지막 이벤트 후 DELAY_THRESHOLD_DAYS일 이상 경과 + 미배송 → INBOUND_DELAY."""
+        if ups_info.get("status") in ("DELIVERED", "FC_RECEIVED"):
+            return None
+        if event_time is None:
+            return None
+        elapsed = datetime.utcnow() - event_time
+        if elapsed.days >= DELAY_THRESHOLD_DAYS:
+            return ShipmentIssue(
+                tracking_number=tracking_number,
+                issue_type=IssueType.INBOUND_DELAY,
+                message=(
+                    f"배송 정체 {elapsed.days}일 경과 — "
+                    f"마지막 이벤트: {event_time.strftime('%Y-%m-%d')} "
+                    f"({ups_info.get('location', '위치 미상')})"
+                ),
+                requires_invoice=True,
+            )
+        return None
+
+    def _check_action_required(
+        self,
+        sp_info: dict,
+        tracking_number: str,
+        amazon_shipment_id: str,
+    ) -> Optional[ShipmentIssue]:
+        """아마존 FC에서 ACTION_REQUIRED / 인보이스 제출 요구 감지."""
+        status = (sp_info.get("amazon_status") or "").upper()
+        mapped = (sp_info.get("mapped_status") or "").upper()
+        if status in _ACTION_REQUIRED_FC_STATUSES or mapped == "ACTION_REQUIRED":
+            return ShipmentIssue(
+                tracking_number=tracking_number,
+                amazon_shipment_id=amazon_shipment_id,
+                issue_type=IssueType.ACTION_REQUIRED,
+                message=(
+                    f"아마존 FC 인보이스 제출 요구 — "
+                    f"Shipment ID: {amazon_shipment_id}, Status: {status}"
+                ),
+                requires_invoice=True,
+            )
+        return None
+
+    def _check_fc_delayed(
+        self,
+        sp_info: dict,
+        tracking_number: str,
+        amazon_shipment_id: str,
+    ) -> Optional[ShipmentIssue]:
+        """FC 입고 처리 지연 감지."""
+        if sp_info.get("mapped_status") == "FC_DELAYED":
+            return ShipmentIssue(
+                tracking_number=tracking_number,
+                amazon_shipment_id=amazon_shipment_id,
+                issue_type=IssueType.FC_DELAYED,
+                message=f"FC 입고 처리 지연 — Shipment ID: {amazon_shipment_id}",
+                requires_invoice=False,
+            )
+        return None
+
+    @staticmethod
+    def _parse_event_time(event_time_str: Optional[str]) -> Optional[datetime]:
+        if not event_time_str:
+            return None
+        try:
+            return datetime.fromisoformat(event_time_str)
+        except ValueError:
+            return None
 
     def close(self):
-        self.ups.close()
-        self.sp.close()
+        if hasattr(self.ups, "close"):
+            self.ups.close()
+        if hasattr(self.sp, "close"):
+            self.sp.close()
 
     def __enter__(self):
         return self

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -95,6 +96,24 @@ class TelegramNotifier:
             f"내용: {message}",
             level=AlertLevel.WARNING,
         )
+
+    def send_invoice_ready(
+        self,
+        invoice_path: Path,
+        context: str = "",
+    ) -> bool:
+        """
+        인보이스 PDF 생성 완료 알림.
+        절대 경로와 함께 '아마존 소명 자료가 준비되었습니다' 메시지를 발송한다.
+        """
+        abs_path = str(invoice_path.resolve())
+        body = (
+            f"아마존 소명 자료가 준비되었습니다.\n\n"
+            f"📄 인보이스 경로:\n`{abs_path}`"
+        )
+        if context:
+            body += f"\n\n📝 {context}"
+        return self.send(body, level=AlertLevel.CRITICAL)
 
     def close(self):
         self._http.close()

@@ -1,18 +1,39 @@
 """
 Cross-Border Matching Engine — Vision (image) similarity providers.
 
-MockVisionMatcher        : deterministic mock for unit tests (no API calls).
-GoogleCloudVisionMatcher : production stub; uses Cloud Vision label/object detection
-                           + Jaccard similarity on the returned label sets.
-                           Retry logic delegated to RetryClient (exponential backoff).
+MockVisionMatcher   : deterministic mock for unit tests (no API calls).
+GeminiVisionMatcher : production matcher using Gemini 1.5 Flash via google-genai SDK.
+                      Downloads both images, sends them as inline data, and asks the
+                      model to score visual similarity on a [0.0, 1.0] scale using a
+                      structured JSON response_schema.  Fail-open: any exception logs
+                      a warning and returns 0.0 so the pipeline is never hard-blocked
+                      by a transient API error.
 """
 from __future__ import annotations
 
+import json
 import logging
 
-from arbitrage_x.ingestion.base import RetryClient
+import httpx
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
+
+_PROMPT = (
+    "두 상품 이미지의 패키징, 텍스트, 브랜드 로고를 비교하여 동일 상품인지 판별하라. "
+    "similarity_score는 0.0(완전히 다른 상품)에서 1.0(동일 상품)까지의 실수로 표현하라."
+)
+
+_RESPONSE_SCHEMA = types.Schema(
+    type="OBJECT",
+    properties={
+        "similarity_score": types.Schema(type="NUMBER"),
+        "reasoning": types.Schema(type="STRING"),
+        "is_same_product": types.Schema(type="BOOLEAN"),
+    },
+    required=["similarity_score", "reasoning", "is_same_product"],
+)
 
 
 class MockVisionMatcher:
@@ -30,74 +51,73 @@ class MockVisionMatcher:
         return self._score
 
 
-class GoogleCloudVisionMatcher:
+class GeminiVisionMatcher:
     """
-    Production image matcher backed by Google Cloud Vision API.
+    Production image matcher backed by Gemini 1.5 Flash (google-genai SDK).
 
-    Fetches LABEL_DETECTION + OBJECT_LOCALIZATION for each image URL,
-    then computes Jaccard similarity on the returned label/object name sets.
+    Both image URLs are fetched via httpx and sent as inline bytes to Gemini.
+    The model responds with structured JSON (response_schema) containing a
+    similarity_score, reasoning, and is_same_product flag.
 
-    Rate-limit (429) and transient network errors are handled by RetryClient
-    with the same exponential-backoff policy used across the rest of the system.
+    On any exception (network error, API error, JSON parse failure) the method
+    logs a warning and returns 0.0 so downstream stages are never hard-blocked.
     """
-
-    _VISION_API_URL = "https://vision.googleapis.com/v1/images:annotate"
 
     def __init__(
         self,
         api_key: str,
         *,
-        max_retries: int = 3,
-        base_delay: float = 1.0,
+        model: str = "gemini-1.5-flash",
+        http_timeout: float = 30.0,
     ):
-        self._api_key = api_key
-        self._client = RetryClient(max_retries=max_retries, base_delay=base_delay)
+        self._model = model
+        self._genai = genai.Client(api_key=api_key)
+        self._http = httpx.Client(timeout=http_timeout, follow_redirects=True)
 
     def compare(self, image_url_a: str, image_url_b: str) -> float:
-        labels_a = self._get_labels(image_url_a)
-        labels_b = self._get_labels(image_url_b)
+        try:
+            bytes_a = self._fetch(image_url_a)
+            bytes_b = self._fetch(image_url_b)
 
-        if not labels_a or not labels_b:
+            config = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=_RESPONSE_SCHEMA,
+            )
+
+            contents = [
+                types.Part(inline_data=types.Blob(data=bytes_a, mime_type="image/jpeg")),
+                types.Part(inline_data=types.Blob(data=bytes_b, mime_type="image/jpeg")),
+                types.Part(text=_PROMPT),
+            ]
+
+            response = self._genai.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=config,
+            )
+
+            result = json.loads(response.text)
+            score = float(result["similarity_score"])
+            return max(0.0, min(1.0, score))
+
+        except Exception as exc:
             logger.warning(
-                "GoogleCloudVisionMatcher: empty label set for (%s, %s)",
+                "GeminiVisionMatcher: comparison failed for (%s, %s): %s",
                 image_url_a,
                 image_url_b,
+                exc,
             )
             return 0.0
 
-        union = len(labels_a | labels_b)
-        return len(labels_a & labels_b) / union if union else 0.0
-
-    def _get_labels(self, image_url: str) -> set[str]:
-        payload = {
-            "requests": [
-                {
-                    "image": {"source": {"imageUri": image_url}},
-                    "features": [
-                        {"type": "LABEL_DETECTION", "maxResults": 20},
-                        {"type": "OBJECT_LOCALIZATION", "maxResults": 10},
-                    ],
-                }
-            ]
-        }
-        resp = self._client.post(
-            f"{self._VISION_API_URL}?key={self._api_key}",
-            json=payload,
-        )
-        data = resp.json()
-        response_block = data.get("responses", [{}])[0]
-
-        labels: set[str] = set()
-        for annotation in response_block.get("labelAnnotations", []):
-            labels.add(annotation["description"].lower())
-        for obj in response_block.get("localizedObjectAnnotations", []):
-            labels.add(obj["name"].lower())
-        return labels
+    def _fetch(self, url: str) -> bytes:
+        resp = self._http.get(url)
+        resp.raise_for_status()
+        return resp.content
 
     def close(self) -> None:
-        self._client.close()
+        self._http.close()
 
-    def __enter__(self) -> "GoogleCloudVisionMatcher":
+    def __enter__(self) -> "GeminiVisionMatcher":
         return self
 
     def __exit__(self, *_) -> None:

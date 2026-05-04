@@ -11,7 +11,7 @@ from arbitrage_x.matching.translation_service import (
     GoogleTranslateService,
     MockTranslationService,
 )
-from arbitrage_x.matching.vision_matcher import GoogleCloudVisionMatcher, MockVisionMatcher
+from arbitrage_x.matching.vision_matcher import GeminiVisionMatcher, MockVisionMatcher
 
 __all__ = [
     "CrossBorderMatchingEngine",
@@ -21,7 +21,7 @@ __all__ = [
     "VisionMatcherProtocol",
     "TranslationServiceProtocol",
     "MockVisionMatcher",
-    "GoogleCloudVisionMatcher",
+    "GeminiVisionMatcher",
     "MockTranslationService",
     "DeepLTranslationService",
     "GoogleTranslateService",

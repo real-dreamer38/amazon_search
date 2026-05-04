@@ -7,7 +7,7 @@ Arbitrage-X — Cross-Border Matching Engine 테스트
   C. Vision API 실패 — text-only 폴백, 번역 일치 → composite = 1.000 → MATCH
   D. Translation API 실패 — 원문 영문 그대로 비교  → composite << 0.95 → NO_MATCH
   E. 양쪽 API 모두 실패 → composite << 0.95 → NO_MATCH
-  F. Vision 재시도 — 429 × 2 후 성공 (RetryClient 지수 백오프 검증)
+  F. GeminiVisionMatcher — 정상 응답 파싱 및 fail-open 동작 검증
   G. Translation 재시도 — 429 × 2 후 성공
   H. 재시도 소진 — HTTPStatusError 전파 확인
   I. 경계값 — composite 정확히 0.95 → MATCH, 0.9499 → NO_MATCH
@@ -38,7 +38,7 @@ from arbitrage_x.matching.translation_service import (
     DeepLTranslationService,
     MockTranslationService,
 )
-from arbitrage_x.matching.vision_matcher import GoogleCloudVisionMatcher, MockVisionMatcher
+from arbitrage_x.matching.vision_matcher import GeminiVisionMatcher, MockVisionMatcher
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -184,46 +184,36 @@ def test_both_apis_fail_results_in_no_match():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# F. Vision API 재시도 — 429 × 2 후 성공
+# F. GeminiVisionMatcher — 정상 응답 검증
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@patch("time.sleep")
-def test_vision_matcher_retries_on_429(mock_sleep):
-    """429 응답 2회 후 정상 응답 → RetryClient 지수 백오프 2회 수행 후 성공."""
-    matcher = GoogleCloudVisionMatcher(api_key="test-key", max_retries=2)
-    _req = httpx.Request("POST", "https://vision.googleapis.com/v1/images:annotate")
+def test_gemini_vision_matcher_returns_score():
+    """Gemini API 정상 응답 시 similarity_score를 파싱하여 반환한다."""
+    from unittest.mock import MagicMock, patch
 
-    call_count = 0
+    matcher = GeminiVisionMatcher(api_key="test-key")
 
-    def fake_request(method, url, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count <= 2:
-            resp = httpx.Response(429, headers={"Retry-After": "0.01"})
-            resp.request = _req
-            return resp
-        resp = httpx.Response(
-            200,
-            json={
-                "responses": [
-                    {
-                        "labelAnnotations": [{"description": "bottle"}, {"description": "product"}],
-                        "localizedObjectAnnotations": [{"name": "Bottle"}],
-                    }
-                ]
-            },
-        )
-        resp.request = _req
-        return resp
+    fake_img_bytes = b"\xff\xd8\xff"  # minimal JPEG header bytes
 
-    with patch.object(matcher._client._http, "request", fake_request):
+    fake_response = MagicMock()
+    fake_response.text = json.dumps({
+        "similarity_score": 0.87,
+        "reasoning": "브랜드 로고와 패키징이 일치함",
+        "is_same_product": True,
+    })
+
+    with patch.object(matcher._http, "get") as mock_get, \
+         patch.object(matcher._genai.models, "generate_content", return_value=fake_response):
+        mock_resp = MagicMock()
+        mock_resp.content = fake_img_bytes
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
         score = matcher.compare("https://img-a.jpg", "https://img-b.jpg")
 
-    # img_a: 429×2 → 200 (3회), img_b: 200 (1회) → 합계 4회
-    assert call_count == 4
-    assert mock_sleep.call_count == 2  # img_a 재시도 2회에 대한 sleep
-    assert 0.0 <= score <= 1.0
+    assert score == pytest.approx(0.87, abs=1e-6)
+    assert mock_get.call_count == 2
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -263,22 +253,16 @@ def test_translation_retries_on_429(mock_sleep):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@patch("time.sleep")
-def test_vision_matcher_raises_after_max_retries(mock_sleep):
-    """모든 재시도 소진 시 HTTPStatusError가 호출자에게 전파된다."""
-    matcher = GoogleCloudVisionMatcher(api_key="test-key", max_retries=2)
-    _req = httpx.Request("POST", "https://vision.googleapis.com/v1/images:annotate")
+def test_gemini_vision_matcher_fail_open_on_api_error():
+    """Gemini API 또는 이미지 다운로드 실패 시 0.0을 반환한다(fail-open)."""
+    from unittest.mock import patch
 
-    def always_429(method, url, **kwargs):
-        resp = httpx.Response(429)
-        resp.request = _req
-        return resp
+    matcher = GeminiVisionMatcher(api_key="test-key")
 
-    with patch.object(matcher._client._http, "request", always_429):
-        with pytest.raises(httpx.HTTPStatusError):
-            matcher.compare("https://img-a.jpg", "https://img-b.jpg")
+    with patch.object(matcher._http, "get", side_effect=httpx.ConnectError("timeout")):
+        score = matcher.compare("https://img-a.jpg", "https://img-b.jpg")
 
-    assert mock_sleep.call_count == 2  # max_retries=2 → sleep 2회
+    assert score == pytest.approx(0.0, abs=1e-6)
 
 
 @patch("time.sleep")
@@ -418,12 +402,12 @@ def test_mock_translation_service_implements_protocol():
     assert isinstance(MockTranslationService(), TranslationServiceProtocol)
 
 
-def test_google_vision_matcher_uses_retry_client():
-    """GoogleCloudVisionMatcher가 RetryClient를 올바른 파라미터로 초기화한다."""
-    matcher = GoogleCloudVisionMatcher(api_key="test-key", max_retries=5, base_delay=2.0)
-    assert isinstance(matcher._client, RetryClient)
-    assert matcher._client.max_retries == 5
-    assert matcher._client.base_delay == 2.0
+def test_gemini_vision_matcher_initializes():
+    """GeminiVisionMatcher가 올바른 모델명으로 초기화된다."""
+    matcher = GeminiVisionMatcher(api_key="test-key", model="gemini-1.5-flash")
+    assert matcher._model == "gemini-1.5-flash"
+    assert matcher._http is not None
+    assert matcher._genai is not None
 
 
 def test_deepl_service_uses_retry_client():

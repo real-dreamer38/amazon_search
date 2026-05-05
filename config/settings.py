@@ -5,7 +5,12 @@ Arbitrage-X — Central Configuration
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# 프로젝트 루트의 .env 파일을 로드 (이미 설정된 환경변수는 덮어쓰지 않음)
+load_dotenv(BASE_DIR / ".env")
 
 # ─── Database ──────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv(
@@ -36,6 +41,9 @@ NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
 # ─── Gemini API ────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# ─── DeepL API ─────────────────────────────────────────────────────────────────
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")
 
 # ─── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")

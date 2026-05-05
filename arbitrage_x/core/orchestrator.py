@@ -322,8 +322,8 @@ class ArbitrageOrchestrator:
         matched: list[tuple[AmazonProductListing, NaverProductListing, MatchResult]] = []
 
         engine = CrossBorderMatchingEngine(
-            vision_matcher=self._vision_matcher,
-            translation_service=self._translation_service,
+            vision_matcher=self._vision_matcher or self._default_vision_matcher(),
+            translation_service=self._translation_service or self._default_translation_service(),
             match_threshold=cfg.match_threshold,
         )
 
@@ -603,3 +603,13 @@ class ArbitrageOrchestrator:
     def _default_uspto_client(self):
         from arbitrage_x.modules.risk_manager import USPTOOpenDataClient
         return USPTOOpenDataClient()
+
+    def _default_vision_matcher(self):
+        from arbitrage_x.matching.vision_matcher import GeminiVisionMatcher
+        from config.settings import GEMINI_API_KEY
+        return GeminiVisionMatcher(api_key=GEMINI_API_KEY)
+
+    def _default_translation_service(self):
+        from arbitrage_x.matching.translation_service import DeepLTranslationService
+        from config.settings import DEEPL_API_KEY
+        return DeepLTranslationService(api_key=DEEPL_API_KEY)

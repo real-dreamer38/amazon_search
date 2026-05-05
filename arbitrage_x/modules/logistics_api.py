@@ -364,8 +364,10 @@ class LogisticsTracker:
         ups_client=None,
         sp_client=None,
     ):
+        # UPS는 실제 OAuth2 클라이언트로 운영. Amazon SP-API는 키 발급 대기 중이라
+        # MockAmazonSPClient를 기본값으로 사용한다 (DI로 실제 클라이언트 주입 가능).
         self.ups = ups_client or UPSClient()
-        self.sp = sp_client or AmazonSPClient()
+        self.sp = sp_client or MockAmazonSPClient()
 
     # ──────────────────────────────────────────────────────────────────────────
     # 공개 API
